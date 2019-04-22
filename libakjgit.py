@@ -123,6 +123,7 @@ def repo_create(path):
         config.write(f)
     return repo
 
+
 def repo_default_config():
     ret = configparser.ConfigParser()
 
@@ -132,6 +133,7 @@ def repo_default_config():
     ret.set("core", "bare", "false")
 
     return ret
+
 
 argsp = argsubparsers.add_parser("init", help="Initialize a new, empty repository.")
 argsp.add_argument("path",
@@ -150,7 +152,7 @@ def repo_find(path=".", required=True):
 
     if os.path.isdir(os.path.join(path, ".git")):
         return GitRepository(path)
-    
+
     # If we have not returned, recurse in parent, if w
     parent = os.path.realpath(os.path.join(path, ".."))
 
@@ -175,12 +177,12 @@ class GitObject(object):
     def __init__(self, repo, data=None):
         self.repo = repo
 
-        if data != None:
+        if data is not None:
             self.deserialize(data)
 
     def serialize(self):
         """This function MUST be implemented by subclasses.
-        
+
         It must read the object's contents from self.data, a byte string, and do
         whatever it takes to convert it into a meaningful representation. what exactly that means depend on each subclass"""
         raise Exception("Unimplemented!")
@@ -211,7 +213,7 @@ def object_read(repo, sha):
         # y は idx なので +1 してる． header + size = len(raw) になっているかの確認
         if size != len(raw) - (y + 1):
             raise Exception("Malformed object {0}: bad length".format(sha))
-        
+
         # Pick constructor
         if fmt == b'commit' : c = GitCommit
         elif fmt == b'tree' : c = GitTree
@@ -225,7 +227,36 @@ def object_read(repo, sha):
 
 
 def object_find(repo, name, fmt=None, follow=True):
-    return name
+    sha = object_resolve(repo, name)
+
+    if not sha:
+        raise Exception("No such reference {0}.".format(name))
+
+    if len(sha) > 1:
+        raise Exception("Ambiguous reference {0}: Candidates are:\n - {1}"
+                        .format(name, "\n - ".join(sha)))
+
+    sha = sha[0]
+
+    if not fmt:
+        return sha
+
+    while True:
+        obj = object_read(repo, sha)
+
+        if obj.fmt == fmt:
+            return sha
+
+        if not follow:
+            return None
+
+        # Follow tags
+        if obj.fmt == b'tag':
+            sha = obj.kvlm[b'object'].decode("ascii")
+        elif obj.fmt == b'commit' and fmt == b'tree':
+            sha = obj.kvlm[b'tree'].decode("ascii")
+        else:
+            return None
 
 
 def object_write(obj, actually_write=True):
@@ -256,9 +287,13 @@ class GitBlob(GitObject):
     def deserialize(self, data):
         self.blobdata = data
 
+
 argsp = argsubparsers.add_parser("cat-file", help="Provide content of repository objects")
 
-argsp.add_argument("type", metavar="type", choices=["blob", "commit", "tag", "tree"], help="Specify the type")
+argsp.add_argument("type",
+                   metavar="type",
+                   choices=["blob", "commit", "tag", "tree"], help="Specify the type")
+
 argsp.add_argument("object", metavar="object", help="The object to display")
 
 
@@ -269,10 +304,11 @@ def cmd_cat_file(args):
 
 def cat_file(repo, obj, fmt=None):
     obj = object_read(repo, object_find(repo, obj, fmt=fmt))
-    sys.stdout.buffer.write(obj.serialize()) # buffer を入れないと str で書き込んでしまう
+    sys.stdout.buffer.write(obj.serialize())  # buffer を入れないと str で書き込んでしまう
 
 
-argsp = argsubparsers.add_parser("hash-object", help="Comput object ID and optionally creates a blob from a file")
+argsp = argsubparsers.add_parser("hash-object",
+                                 help="Comput object ID and optionally creates a blob from a file")
 
 argsp.add_argument("-t",
                    metavar="type",
@@ -562,3 +598,124 @@ def tree_checkout(repo, tree, path):
             with open(dest, 'wb') as f:
                 f.write(obj.blobdata)
 
+
+def ref_resolve(repo, ref):
+    with open(repo_file(repo, ref), 'r') as fp:
+        data = fp.read()[:-1]
+        # Drop final \n
+    if data.startswith("ref: "):
+        return ref_resolve(repo, data[5:])
+    else:
+        return data
+
+
+def ref_list(repo, path=None):
+    if not path:
+        path = repo_dir(repo, "refs")
+    ret = collections.OrderedDict()
+    # Git shows refs sorted. To do the same, we use
+    # an OrderedDict and sort the output of listdir
+    for f in sorted(os.listdir(path)):
+        can = os.path.join(path, f)
+        if os.path.isdir(can):
+            ret[f] = ref_list(repo, can)
+        else:
+            ret[f] = ref_resolve(repo, can)
+
+    return ret
+
+
+argsp = argsubparsers.add_parser("show-ref",
+                                 help="List refernces.")
+
+
+def cmd_show_ref(args):
+    repo = repo_find()
+    refs = ref_list(repo)
+    show_ref(repo, refs, prefix="refs")
+
+
+def show_ref(repo, refs, with_hash=True, prefix=""):
+    for k, v in refs.items():
+        if type(v) == str:
+            print("{0}{1}{2}".format(
+                v + " " if with_hash else "",
+                prefix + "/" if prefix else "",
+                k))
+        else:
+            show_ref(repo, v, with_hash=with_hash,
+                     prefix="{0}{1}{2}".format(
+                        prefix, "/" if prefix else "", k))
+
+
+class GitTag(GitCommit):
+    fmt = b'tag'
+
+
+argsp = argsubparsers.add_parser("tag", help="List and create tags.")
+argsp.add_argument("-a",
+                   action="store_true",
+                   dest="create_tag_object",
+                   help="Whether to create a tag object")
+argsp.add_argument("name",
+                   nargs="?",
+                   help="The new tag's name")
+argsp.add_argument("object",
+                   default="HEAD",
+                   nargs="?",
+                   help="The object the new tag will point to")
+
+
+def cmd_tag(args):
+    repo = repo_find()
+
+    if args.name:
+        # @TODO Write tag_create()!
+        tag_create(args.name,
+                   args.object,
+                   type="object" if args.create_tag_object else "ref")
+    else:
+        refs = ref_list(repo)
+        show_ref(repo, refs["tags"], with_hash=False)
+
+
+def object_resolve(repo, name):
+    """Resolve name to an object hash in repo.
+    This function is aware of:
+    - the HEAD literal
+    - short and long hashes
+    - tags
+    - branches
+    - remote branches
+    """
+    candidates = list()
+    hashRE = re.compile(r"[0-9A-Fa-f]{1,16}$")
+    smallHashRE = re.compile(r"^[0-9A-Fa-f]{1,16}$")
+
+    # Empty string? Abort.
+    if not name.strip():
+        return None
+
+    # Head is nonambiguous
+    if name == "HEAD":
+        return [ ref_resolve(repo, "HEAD") ]
+
+    if hashRE.match(name):
+        if len(name) == 40:
+            # This is a complete hash
+            return [ name.lower() ]
+        elif len(name) >= 4:
+            # This is a small hash 4 seems to be minimal length
+            # for git to consider something a short hash.
+            # This limit is documented in man git-rev-parse
+            name = name.lower()
+            # Remember there is a dir
+            # which is named first two char of the hash.
+            prefix = name[0:2]
+            path = repo_dir(repo, "objects", prefix, mkdir=False)
+            if path:
+                rem = name[2:]
+                for f in os.listdir(path):
+                    if f.startswith(rem):
+                        candidates.append(prefix + f)
+    return candidates
